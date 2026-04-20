@@ -1,0 +1,38 @@
+Claude Code v2.1.114  general   commands   custom-commands
+
+
+  Claude understands your codebase, makes edits with your permission, and executes commands — right from your terminal.                                                                                                                                 ,…
+                                                                                                                                                                                                                                                         ,…
+  New here? Run /powerup to learn the features most people miss.                                                                                           .
+
+  Shortcuts
+  ! for bash mode           double tap esc to clear input        ctrl + shift + - to undo
+  / for commands            shift + tab to auto-accept edits     alt + v to paste images
+  @ for file paths          ctrl + o for verbose output          alt + p to switch model
+  & for background          ctrl + t to toggle tasks             ctrl + s to stash prompt
+  /btw for side question    backslash (\) + return (⏎) for       ctrl + g to edit in $EDITOR
+                            newline                              /keybindings to customize
+
+
+  For more help: https://code.claude.com/docs/en/overview
+
+  Something else? Use /feedback to report bugs or request features.
+
+  Esc to cancel
+
+
+
+接下来的计划
+
+能不能 检测 转发 与 转出 的token使用量
+
+
+
+
+
+
+
+
+
+
+  

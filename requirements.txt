@@ -1,0 +1,6 @@
+flask
+requests
+
+# 可选依赖（取消注释以启用）
+# flask-cors
+# flask-limiter
