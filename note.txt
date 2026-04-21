@@ -31,6 +31,20 @@ Claude Code v2.1.114  general   commands   custom-commands
 
 
 
+这个转换API项目今天也就开发完成了
+
+也可以告一段落
+
+同时也上传到我的GitHub上
+
+后续也就是每天学习使用claude code使用
+
+有新的想法也可以做个小项目实践一下
+
+现在cluade code 确实功能强大
+
+
+
 
 
 

@@ -7,6 +7,13 @@ import os
 from dotenv import load_dotenv
 load_dotenv()
 
+# 导入定时任务相关模块
+from apscheduler.schedulers.background import BackgroundScheduler
+from datetime import datetime
+
+# 导入Token统计模块
+from token_stats import get_token_stats
+
 # 可选依赖的条件导入
 try:
     from flask_cors import CORS
@@ -202,6 +209,7 @@ def anthropic_to_openai():
     temperature = data.get("temperature", 0.7)
     max_tokens = data.get("max_tokens", 4096)
     tool_choice = data.get("tool_choice", "auto")
+    stream = data.get("stream", False)
 
     # 验证数值参数
     if not isinstance(temperature, (int, float)) or temperature < 0 or temperature > 2:
@@ -306,31 +314,41 @@ def anthropic_to_openai():
         "messages": openai_messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
-        "stream": False
+        "stream": stream
     }
     if openai_tools:
         payload["tools"] = openai_tools
         payload["tool_choice"] = openai_tool_choice
 
-    logger.info(f"开始请求火山方舟API | URL: {volc_url} | 模型: {VOLC_MODEL}")
+    logger.info(f"开始请求火山方舟API | URL: {volc_url} | 模型: {VOLC_MODEL} | 流式: {stream}")
     logger.debug(f"火山方舟请求体: {payload}")
 
+    if stream:
+        # 处理流式响应
+        return handle_stream_response(data, payload, volc_url, headers)
+    else:
+        # 处理非流式响应
+        return handle_non_stream_response(data, payload, volc_url, headers)
+
+
+def handle_non_stream_response(claude_request: dict, payload: dict, volc_url: str, headers: dict):
+    """处理非流式响应"""
     try:
         resp = requests.post(volc_url, json=payload, headers=headers, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
-        res = resp.json()
+        openai_response = resp.json()
 
-        if not res.get("choices") or len(res["choices"]) == 0:
+        if not openai_response.get("choices") or len(openai_response["choices"]) == 0:
             logger.error("火山方舟响应异常 | choices字段为空")
             return jsonify({"error": "Volc API returned empty choices"}), 500
 
-        choice = res["choices"][0]
+        choice = openai_response["choices"][0]
         message = choice["message"]
-        usage = res.get("usage", {})
+        usage = openai_response.get("usage", {})
         input_tokens = usage.get("prompt_tokens", 0)
         output_tokens = usage.get("completion_tokens", 0)
 
-        # 5. 转换响应格式 (OpenAI -> Anthropic)
+        # 转换响应格式 (OpenAI -> Anthropic)
         content_list = []
         finish_reason = message.get("finish_reason", "stop")
 
@@ -355,7 +373,7 @@ def anthropic_to_openai():
             if finish_reason == "length":
                 finish_reason = "max_tokens"
 
-        response_data = {
+        claude_response = {
             "id": f"msg-{uuid.uuid4()}",
             "type": "message",
             "role": "assistant",
@@ -369,18 +387,260 @@ def anthropic_to_openai():
             }
         }
 
-        response_type = 'tool_use' if any(c.get('type') == 'tool_use' for c in content_list) else 'text'
-        logger.info(f"请求处理完成 | IP: {request.remote_addr} | 响应类型: {response_type}")
-        return jsonify(response_data)
+        # Token统计（不影响主流程）
+        try:
+            token_stats = get_token_stats()
+            token_stats.calculate_stats(
+                claude_request=claude_request,
+                claude_response=claude_response,
+                openai_request=payload,
+                openai_response=openai_response
+            )
+        except Exception as e:
+            logger.warning(f"Token统计失败: {e}", exc_info=True)
 
-    except requests.exceptions.RequestException as e:
-        logger.error(f"火山方舟API请求失败 | 错误: {str(e)}", exc_info=True)
-        # 不向客户端泄露详细错误信息
+        response_type = 'tool_use' if any(c.get('type') == 'tool_use' for c in content_list) else 'text'
+        logger.info(f"请求处理完成 | IP: {request.remote_addr} | 响应类型: {response_type} | 流式: False")
+        return jsonify(claude_response)
+
+    except Exception as e:
+        logger.error(f"非流式响应处理失败: {e}", exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
-    except KeyError as e:
-        logger.error(f"火山方舟响应格式错误 | 缺失字段: {str(e)}", exc_info=True)
-        # 不向客户端泄露详细错误信息
-        return jsonify({"error": "Internal server error"}), 500
+
+
+def handle_stream_response(claude_request: dict, payload: dict, volc_url: str, headers: dict):
+    """处理流式响应"""
+    from flask import Response
+
+    # 在请求上下文中获取客户端IP
+    client_ip = request.remote_addr if request else "unknown"
+
+    # 用于收集完整响应以进行Token统计
+    full_openai_response = {
+        "choices": [{
+            "message": {
+                "content": "",
+                "tool_calls": []
+            },
+            "finish_reason": None
+        }],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0}
+    }
+    accumulated_text = ""
+    current_tool_calls = {}
+
+    def generate():
+        nonlocal accumulated_text, current_tool_calls
+        try:
+            resp = requests.post(volc_url, json=payload, headers=headers, stream=True, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+
+            msg_id = f"msg-{uuid.uuid4()}"
+            first_event = True
+
+            for line in resp.iter_lines():
+                if not line:
+                    continue
+                line = line.decode('utf-8')
+                if line.startswith('data: '):
+                    data = line[6:]
+                    if data == '[DONE]':
+                        break
+                    try:
+                        openai_chunk = json.loads(data)
+
+                        # 提取内容用于统计
+                        if openai_chunk.get('choices'):
+                            choice = openai_chunk['choices'][0]
+                            delta = choice.get('delta', {})
+
+                            # 收集文本内容
+                            if 'content' in delta and delta['content']:
+                                nonlocal accumulated_text
+                                accumulated_text += delta['content']
+
+                            # 收集工具调用
+                            if 'tool_calls' in delta:
+                                for tc in delta['tool_calls']:
+                                    idx = tc.get('index', 0)
+                                    if idx not in current_tool_calls:
+                                        current_tool_calls[idx] = {
+                                            "id": tc.get('id', ''),
+                                            "type": "function",
+                                            "function": {
+                                                "name": "",
+                                                "arguments": ""
+                                            }
+                                        }
+                                    if 'id' in tc:
+                                        current_tool_calls[idx]['id'] = tc['id']
+                                    if 'function' in tc:
+                                        if 'name' in tc['function']:
+                                            current_tool_calls[idx]['function']['name'] += tc['function']['name']
+                                        if 'arguments' in tc['function']:
+                                            current_tool_calls[idx]['function']['arguments'] += tc['function']['arguments']
+
+                            # 更新finish_reason
+                            if 'finish_reason' in choice and choice['finish_reason']:
+                                full_openai_response['choices'][0]['finish_reason'] = choice['finish_reason']
+
+                        # 提取usage（如果有）
+                        if 'usage' in openai_chunk and openai_chunk['usage']:
+                            full_openai_response['usage'] = openai_chunk['usage']
+
+                        # 转换为Claude流式格式并发送
+                        claude_event = convert_openai_chunk_to_claude(openai_chunk, msg_id)
+                        if claude_event:
+                            if first_event:
+                                first_event = False
+                            yield f"data: {json.dumps(claude_event, ensure_ascii=False)}\n\n"
+
+                    except json.JSONDecodeError as e:
+                        logger.warning(f"解析流式数据失败: {e}")
+                        continue
+
+            # 流结束后，构建完整的响应数据用于Token统计
+            full_openai_response['choices'][0]['message']['content'] = accumulated_text
+            if current_tool_calls:
+                full_openai_response['choices'][0]['message']['tool_calls'] = list(current_tool_calls.values())
+
+            # 构建完整的Claude响应用于统计
+            claude_response = build_full_claude_response_for_stats(
+                msg_id, accumulated_text, current_tool_calls,
+                full_openai_response['choices'][0]['finish_reason'],
+                full_openai_response['usage']
+            )
+
+            # Token统计（不影响主流程）
+            try:
+                token_stats = get_token_stats()
+                token_stats.calculate_stats(
+                    claude_request=claude_request,
+                    claude_response=claude_response,
+                    openai_request=payload,
+                    openai_response=full_openai_response
+                )
+            except Exception as e:
+                logger.warning(f"Token统计失败: {e}", exc_info=True)
+
+            logger.info(f"流式请求处理完成 | IP: {client_ip}")
+
+        except Exception as e:
+            logger.error(f"流式响应处理失败: {e}", exc_info=True)
+            yield f"data: {{\"type\": \"error\", \"message\": \"Stream error\"}}\n\n"
+
+    return Response(generate(), mimetype='text/event-stream')
+
+
+def convert_openai_chunk_to_claude(openai_chunk: dict, msg_id: str) -> dict:
+    """将OpenAI流式chunk转换为Claude格式"""
+    if not openai_chunk.get('choices'):
+        return None
+
+    choice = openai_chunk['choices'][0]
+    delta = choice.get('delta', {})
+    finish_reason = choice.get('finish_reason')
+
+    event = {
+        "type": "message_delta",
+        "message": {
+            "id": msg_id,
+            "type": "message",
+            "role": "assistant",
+            "model": "DouBao"
+        },
+        "delta": {},
+        "usage": None
+    }
+
+    # 处理文本内容
+    if 'content' in delta and delta['content']:
+        event['delta'] = {
+            "type": "text_delta",
+            "text": delta['content']
+        }
+
+    # 处理工具调用
+    elif 'tool_calls' in delta:
+        for tc in delta['tool_calls']:
+            if tc.get('function', {}).get('name'):
+                event['delta'] = {
+                    "type": "tool_use",
+                    "id": tc.get('id', ''),
+                    "name": tc['function']['name'],
+                    "input": {}
+                }
+            elif tc.get('function', {}).get('arguments'):
+                event['delta'] = {
+                    "type": "input_json_delta",
+                    "partial_json": tc['function']['arguments']
+                }
+
+    # 处理结束
+    if finish_reason:
+        claude_stop_reason = finish_reason
+        if finish_reason == "tool_calls":
+            claude_stop_reason = "tool_use"
+        elif finish_reason == "length":
+            claude_stop_reason = "max_tokens"
+
+        event['delta'] = {"stop_reason": claude_stop_reason}
+
+        # 添加usage（如果有）
+        if 'usage' in openai_chunk and openai_chunk['usage']:
+            event['usage'] = {
+                "input_tokens": openai_chunk['usage'].get('prompt_tokens', 0),
+                "output_tokens": openai_chunk['usage'].get('completion_tokens', 0)
+            }
+
+    return event
+
+
+def build_full_claude_response_for_stats(
+    msg_id: str,
+    text: str,
+    tool_calls: dict,
+    finish_reason: str,
+    usage: dict
+) -> dict:
+    """构建完整的Claude响应用于Token统计"""
+    content_list = []
+
+    if tool_calls:
+        for idx in sorted(tool_calls.keys()):
+            tc = tool_calls[idx]
+            try:
+                args = json.loads(tc['function']['arguments'])
+            except (json.JSONDecodeError, TypeError):
+                args = {}
+            content_list.append({
+                "type": "tool_use",
+                "id": tc['id'],
+                "name": tc['function']['name'],
+                "input": args
+            })
+    elif text:
+        content_list.append({"type": "text", "text": text})
+
+    claude_stop_reason = finish_reason
+    if finish_reason == "tool_calls":
+        claude_stop_reason = "tool_use"
+    elif finish_reason == "length":
+        claude_stop_reason = "max_tokens"
+
+    return {
+        "id": msg_id,
+        "type": "message",
+        "role": "assistant",
+        "content": content_list,
+        "model": "DouBao",
+        "stop_reason": claude_stop_reason,
+        "usage": {
+            "input_tokens": usage.get('prompt_tokens', 0),
+            "output_tokens": usage.get('completion_tokens', 0),
+            "total_tokens": usage.get('prompt_tokens', 0) + usage.get('completion_tokens', 0)
+        }
+    }
 
 
 # 健康检查
@@ -389,7 +649,57 @@ def health():
     return jsonify({"status": "ok"}), 200
 
 
+# Token统计接口
+@app.route('/stats', methods=['GET'])
+def get_stats():
+    """获取Token累积统计信息"""
+    token_stats = get_token_stats()
+    stats = token_stats.get_accumulated_stats()
+    return jsonify({
+        "status": "ok",
+        "data": stats
+    }), 200
+
+
+@app.route('/stats/log', methods=['GET'])
+def log_stats():
+    """记录并返回Token累积统计日志"""
+    token_stats = get_token_stats()
+    token_stats.log_accumulated_stats()
+    stats = token_stats.get_accumulated_stats()
+    return jsonify({
+        "status": "ok",
+        "message": "累积统计已记录到日志",
+        "data": stats
+    }), 200
+
+
+@app.route('/stats/reset', methods=['POST'])
+def reset_stats():
+    """重置Token累积统计"""
+    token_stats = get_token_stats()
+    token_stats.reset_accumulated_stats()
+    return jsonify({
+        "status": "ok",
+        "message": "累积统计已重置"
+    }), 200
+
+
+def setup_scheduler():
+    """设置定时任务"""
+    scheduler = BackgroundScheduler()
+    # 每分钟记录一次累积统计
+    scheduler.add_job(
+        lambda: get_token_stats().log_accumulated_stats(),
+        'interval',
+        minutes=1
+    )
+    scheduler.start()
+    logger.info("定时任务已启动，每分钟记录一次累积统计")
+
+
 if __name__ == '__main__':
+    setup_scheduler()
     logger.info("=" * 50)
     logger.info("中转服务启动（已激活Claude内置工具）")
     logger.info(f"地址: http://{SERVER_HOST}:{SERVER_PORT}")
@@ -403,4 +713,3 @@ if __name__ == '__main__':
     print(f"📝 日志：仅控制台输出（已移除日志文件）\n")
 
     app.run(host=SERVER_HOST, port=SERVER_PORT, debug=False)
-    

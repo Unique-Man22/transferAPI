@@ -1,6 +1,17 @@
 flask
 requests
+python-dotenv
 
-# 可选依赖（取消注释以启用）
-# flask-cors
-# flask-limiter
+# 可选依赖 - 用于CORS支持
+flask-cors
+
+# 可选依赖 - 用于速率限制
+flask-limiter
+
+# Token统计相关依赖
+# 使用tiktoken作为Claude和豆包的统一分词器
+tiktoken>=0.5.0
+
+# 定时任务工具
+# 让程序能在后台自动、定时、重复执行某些代码
+apscheduler
